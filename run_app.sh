@@ -61,7 +61,7 @@ if [ $? -eq 0 ]; then
     echo ""
     
     # Start Streamlit
-    streamlit run app.py
+    python3 -m streamlit run app.py
 else
     echo "❌ Functionality test failed. Please check the implementation."
     exit 1
