@@ -8,10 +8,20 @@ from collections import defaultdict, Counter
 
 class KnowledgeGraphBuilder:
     def __init__(self, api_key: str):
-        self.client = openai.OpenAI(api_key=api_key)
+        self.client = openai.OpenAI(api_key=api_key) if api_key else None
         self.graph = nx.Graph()
         self.node_metadata = {}
         self.concept_cache = {}
+        self.processing_mode = "fast"  # Default to fast mode
+    
+    def set_processing_mode(self, mode_string: str):
+        """Set processing mode based on UI selection."""
+        if "Fast" in mode_string:
+            self.processing_mode = "fast"
+        elif "Accurate" in mode_string:
+            self.processing_mode = "accurate"
+        elif "Premium" in mode_string:
+            self.processing_mode = "premium"
     
     def build_graph(self, documents: List[Dict]) -> nx.Graph:
         """Build knowledge graph from document chunks."""
@@ -20,17 +30,26 @@ class KnowledgeGraphBuilder:
         all_concepts = []
         concept_to_sources = defaultdict(list)
         
-        # Process documents in batches
+        # Process documents in batches for better performance
+        batch_size = 5  # Process 5 documents at once
         progress_bar = st.progress(0)
-        for i, doc in enumerate(documents):
-            concepts = self._extract_concepts(doc['content'])
-            all_concepts.extend(concepts)
+        
+        for i in range(0, len(documents), batch_size):
+            batch = documents[i:i + batch_size]
             
-            # Track which documents contain which concepts
-            for concept in concepts:
-                concept_to_sources[concept].append(doc)
+            # Extract concepts from batch
+            batch_concepts = self._extract_concepts_batch(batch)
             
-            progress_bar.progress((i + 1) / len(documents))
+            # Process results
+            for j, doc in enumerate(batch):
+                concepts = batch_concepts[j] if j < len(batch_concepts) else []
+                all_concepts.extend(concepts)
+                
+                # Track which documents contain which concepts
+                for concept in concepts:
+                    concept_to_sources[concept].append(doc)
+            
+            progress_bar.progress(min(1.0, (i + batch_size) / len(documents)))
         
         st.info("Building graph structure...")
         self._build_nodes(all_concepts, concept_to_sources)
@@ -39,50 +58,110 @@ class KnowledgeGraphBuilder:
         st.success(f"Graph built with {self.graph.number_of_nodes()} nodes and {self.graph.number_of_edges()} edges")
         return self.graph
     
+    def _extract_concepts_batch(self, documents: List[Dict]) -> List[List[str]]:
+        """Extract concepts from multiple documents in a single API call."""
+        # Check cache for all documents first
+        results = []
+        uncached_docs = []
+        uncached_indices = []
+        
+        for i, doc in enumerate(documents):
+            cache_key = hash(doc['content'][:100])
+            if cache_key in self.concept_cache:
+                results.append(self.concept_cache[cache_key])
+            else:
+                results.append(None)  # Placeholder
+                uncached_docs.append(doc)
+                uncached_indices.append(i)
+        
+        # Process uncached documents based on mode
+        if uncached_docs and self.processing_mode != "fast":
+            try:
+                # Create batch prompt
+                batch_texts = []
+                for doc in uncached_docs:
+                    batch_texts.append(doc['content'][:800])  # Limit text length
+                
+                prompt = f"""
+                Extract 5-8 key concepts from each of the following {len(batch_texts)} text segments.
+                Return ONLY a JSON array where each element is an array of concepts for that text.
+                
+                Focus on: named entities, important topics, technical terms, key events.
+                
+                Texts:
+                {chr(10).join([f"Text {i+1}: {text}" for i, text in enumerate(batch_texts)])}
+                
+                Return format: [["concept1", "concept2"], ["concept3", "concept4"], ...]
+                """
+                
+                # Choose model based on processing mode
+                model = "gpt-4" if self.processing_mode == "premium" else "gpt-4o-mini"
+                
+                if not self.client:
+                    raise Exception("No API key provided")
+                
+                response = self.client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                    max_tokens=800
+                )
+                
+                content = response.choices[0].message.content.strip()
+                json_match = re.search(r'\[.*\]', content, re.DOTALL)
+                
+                if json_match:
+                    batch_concepts = json.loads(json_match.group())
+                    
+                    # Validate and clean results
+                    for i, concepts in enumerate(batch_concepts):
+                        if i < len(uncached_docs):
+                            clean_concepts = [c.strip() for c in concepts if isinstance(c, str) and len(c.strip()) > 2]
+                            cache_key = hash(uncached_docs[i]['content'][:100])
+                            self.concept_cache[cache_key] = clean_concepts
+                            results[uncached_indices[i]] = clean_concepts
+                
+            except Exception as e:
+                st.warning(f"Batch extraction failed, using fallback: {str(e)}")
+                # Fallback for uncached documents
+                for i in uncached_indices:
+                    if results[i] is None:
+                        results[i] = self._extract_concepts_fallback(documents[i]['content'])
+        
+        # Ensure all results are filled
+        for i, result in enumerate(results):
+            if result is None:
+                results[i] = self._extract_concepts_fallback(documents[i]['content'])
+        
+        return results
+    
+    def _extract_concepts_fallback(self, text: str) -> List[str]:
+        """Fast fallback concept extraction using regex patterns."""
+        concepts = set()
+        
+        # Extract capitalized phrases (likely entities)
+        capitalized = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
+        concepts.update(capitalized[:8])
+        
+        # Extract technical terms (words ending in -tion, -ment, -ness, etc.)
+        technical = re.findall(r'\b\w+(?:tion|ment|ness|ity|ism|ogy|ing)\b', text, re.IGNORECASE)
+        concepts.update([t.lower() for t in technical[:5]])
+        
+        # Extract quoted terms
+        quoted = re.findall(r'"([^"]+)"', text)
+        concepts.update([q.strip() for q in quoted[:3]])
+        
+        return list(concepts)[:10]
+    
     def _extract_concepts(self, text: str) -> List[str]:
-        """Extract key concepts from text using GPT-4."""
+        """Extract key concepts from text using GPT-4 (legacy single method)."""
         # Check cache first
-        cache_key = hash(text[:100])  # Use first 100 chars as cache key
+        cache_key = hash(text[:100])
         if cache_key in self.concept_cache:
             return self.concept_cache[cache_key]
         
-        prompt = f"""
-        Extract 5-10 key concepts, entities, and topics from the following text. 
-        Return ONLY a JSON list of concepts as strings. Focus on:
-        - Named entities (people, places, organizations)
-        - Important topics and themes
-        - Technical terms and concepts
-        - Key events or processes
-        
-        Text: {text[:1000]}...
-        
-        Return format: ["concept1", "concept2", "concept3"]
-        """
-        
-        try:
-            response = self.client.chat.completions.create(
-                model="gpt-4",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=200
-            )
-            
-            content = response.choices[0].message.content.strip()
-            # Extract JSON from response
-            json_match = re.search(r'\[.*?\]', content, re.DOTALL)
-            if json_match:
-                concepts = json.loads(json_match.group())
-                # Clean and validate concepts
-                concepts = [c.strip() for c in concepts if isinstance(c, str) and len(c.strip()) > 2]
-                self.concept_cache[cache_key] = concepts
-                return concepts
-            
-        except Exception as e:
-            st.warning(f"Error extracting concepts: {str(e)}")
-        
-        # Fallback: simple keyword extraction
-        words = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
-        return list(set(words[:10]))
+        # Use fallback for speed during development
+        return self._extract_concepts_fallback(text)
     
     def _build_nodes(self, all_concepts: List[str], concept_to_sources: Dict):
         """Add nodes to the graph with metadata."""

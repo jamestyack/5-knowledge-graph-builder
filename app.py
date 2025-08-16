@@ -44,9 +44,21 @@ def main():
             help="Enter your OpenAI API key for GPT-4 processing"
         )
         
-        if not api_key:
-            st.error("Please enter your OpenAI API key to proceed")
-            return
+        # Processing mode selection
+        st.subheader("Processing Mode")
+        processing_mode = st.radio(
+            "Choose processing speed:",
+            ["🚀 Fast (Regex-based)", "🎯 Accurate (GPT-4o-mini)", "🔬 Premium (GPT-4)"],
+            index=0,
+            help="Fast mode: Instant results using pattern matching\nAccurate mode: Good balance of speed and quality\nPremium mode: Best quality but slower"
+        )
+        
+        # Show API key requirement based on mode
+        if "Fast" not in processing_mode and not api_key:
+            st.error("API key required for Accurate/Premium modes")
+            st.info("💡 Use Fast mode for instant results without API key")
+        elif "Fast" in processing_mode:
+            st.info("🚀 Fast mode selected - no API key needed!")
         
         st.divider()
         
@@ -70,9 +82,12 @@ def main():
         )
         
         # Process documents button
-        if st.button("🚀 Build Knowledge Graph", type="primary"):
-            if uploaded_files or url_input.strip():
-                process_documents(api_key, uploaded_files, url_input)
+        can_process = uploaded_files or url_input.strip()
+        needs_api_key = "Fast" not in processing_mode and not api_key
+        
+        if st.button("🚀 Build Knowledge Graph", type="primary", disabled=needs_api_key):
+            if can_process:
+                process_documents(api_key, uploaded_files, url_input, processing_mode)
             else:
                 st.error("Please upload files or enter URLs")
     
@@ -82,13 +97,14 @@ def main():
     else:
         show_welcome_screen()
 
-def process_documents(api_key: str, uploaded_files, url_input: str):
+def process_documents(api_key: str, uploaded_files, url_input: str, processing_mode: str):
     """Process uploaded files and URLs to build knowledge graph."""
     with st.spinner("Processing documents and building knowledge graph..."):
         try:
             # Initialize components
             ingester = DocumentIngester()
             st.session_state.graph_builder = KnowledgeGraphBuilder(api_key)
+            st.session_state.graph_builder.set_processing_mode(processing_mode)
             
             # Process documents
             documents = []
